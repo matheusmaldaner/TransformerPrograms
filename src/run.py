@@ -545,6 +545,118 @@ def run_program(
 
     return df  # Returns a DataFrame containing training and evaluation metrics
 
+def run_standard(
+    args,
+    train=None,
+    test=None,
+    idx_w=None,
+    w_idx=None,
+    idx_t=None,
+    t_idx=None,
+    X_train=None,
+    Y_train=None,
+    X_test=None,
+    Y_test=None,
+    X_val=None,
+    Y_val=None,
+):
+    # Sets up a standard Transformer model based on the provided arguments
+    init_emb = None
+    if args.glove_embeddings and args.do_glove:
+        # Loads GloVe embeddings if specified and prepares them for initialization
+        emb = data_utils.get_glove_embeddings(
+            idx_w,
+            args.glove_embeddings,
+            dim=args.d_model,
+        )
+        init_emb = torch.tensor(emb, dtype=torch.float32).T
+
+    unembed_mask = None
+    if args.unembed_mask:
+        # Masks specific tokens (e.g., `<unk>`, `<pad>`) during the unembedding stage
+        unembed_mask = np.array([t in ("<unk>", "<pad>") for t in idx_t])
+
+    # Initializes a standard Transformer model with the given configuration
+    model = Transformer(
+        d_vocab=len(idx_w),  # Input vocabulary size
+        d_vocab_out=len(idx_t),  # Output vocabulary size
+        n_layers=args.n_layers,  # Number of layers in the Transformer
+        d_model=args.d_model,  # Model dimensionality
+        d_mlp=args.d_mlp,  # MLP hidden layer size
+        n_heads=args.n_heads,  # Number of attention heads
+        n_ctx=X_train.shape[1],  # Context length (sequence length)
+        dropout=args.dropout,  # Dropout rate for regularization
+        init_emb=init_emb,  # Optional initialized embeddings
+        unembed_mask=unembed_mask,  # Mask for output unembedding
+        pool_outputs=args.pool_outputs,  # Pool outputs across the sequence if enabled
+    ).to(torch.device(args.device))
+
+    # Sets up the optimizer and prepares for training
+    opt = Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
+    n_epochs = args.n_epochs
+    set_seed(args.seed)  # Ensures reproducibility
+
+    # Trains the model and evaluates on validation and test datasets
+    out = run_training(
+        model,
+        opt,
+        X_train,
+        Y_train,
+        eval_splits=[("val", X_val, Y_val), ("test", X_test, Y_test)],
+        batch_size=args.batch_size,
+        n_epochs=n_epochs,
+        n_samples=1,
+        autoregressive=args.autoregressive,
+        x_pad_idx=w_idx["<pad>"],
+        y_pad_idx=t_idx["<pad>"],
+        loss_agg=args.loss_agg,
+        o_idx=t_idx.get("O", None),
+        idx_t=idx_t,
+    )
+
+    dfs = [out]
+    for split, X, Y in [
+        ("train", X_train, Y_train),
+        ("val", X_val, Y_val),
+        ("test", X_test, Y_test),
+    ]:
+        # Evaluates the model on each split and logs the results
+        loss, acc, metrics, preds, true = run_test(
+            model,
+            X,
+            Y,
+            return_preds=True,
+            x_pad_idx=w_idx["<pad>"],
+            y_pad_idx=t_idx["<pad>"],
+            autoregressive=args.autoregressive,
+            loss_agg=args.loss_agg,
+            o_idx=t_idx.get("O", None),
+            idx_t=idx_t,
+        )
+        logger.info(f"end ({split}): loss={loss}, acc={acc}, metrics={metrics}")
+        df = pd.DataFrame(
+            {
+                "epoch": [n_epochs],
+                "split": split,
+                "loss": loss,
+                "acc": acc,
+            }
+        )
+        for k, v in metrics.items():
+            # Adds detailed metrics (if available) to the DataFrame
+            df[k] = v
+        dfs.append(df)
+
+    df = pd.concat(dfs).reset_index(drop=True)  # Combines metrics for all splits
+
+    if args.save:
+        # Saves the trained model to a file
+        fn = Path(args.output_dir) / "model.pt"
+        logger.info(f"saving model to {fn}")
+        torch.save(model.state_dict(), str(fn))
+
+    return df  # Returns the training and evaluation metrics as a DataFrame
+
 def run(args):
     # Prepares data, initializes models, and handles the training pipeline
     set_seed(args.seed)
